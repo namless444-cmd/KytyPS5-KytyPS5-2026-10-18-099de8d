@@ -1089,9 +1089,9 @@ struct SystemOverlay::Impl {
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.0f * screen_scale);
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24.0f * screen_scale, 20.0f * screen_scale));
+		ImGui::PushFont(nullptr, 16.0f * screen_scale);
 
 		if (ImGui::Begin("##PipelineCompiling", nullptr, flags)) {
-			ImGui::SetWindowFontScale(screen_scale);
 			ImGui::TextColored(ImVec4(0.95f, 0.95f, 0.98f, 1.0f), "Pre-compiling Shaders & Pipelines");
 			ImGui::Spacing();
 			ImGui::TextColored(ImVec4(0.70f, 0.75f, 0.82f, 1.0f),
@@ -1106,6 +1106,7 @@ struct SystemOverlay::Impl {
 			ImGui::PopStyleColor();
 		}
 		ImGui::End();
+		ImGui::PopFont();
 		ImGui::PopStyleVar(3);
 		ImGui::PopStyleColor(2);
 	}

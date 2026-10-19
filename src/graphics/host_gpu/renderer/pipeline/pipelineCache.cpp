@@ -995,11 +995,11 @@ void PipelineCache::PrecompilePipelines() {
 					vk::ShaderModule module = nullptr;
 					if (m_graphics.device.createShaderModule(&sm_info, nullptr, &module) == vk::Result::eSuccess) {
 						modules_to_destroy.push_back(module);
-						shader_stages.push_back({
-							.stage = NativeShaderStage(st.stage),
-							.module = module,
-							.pName = "main"
-						});
+						vk::PipelineShaderStageCreateInfo stage_ci {};
+						stage_ci.stage  = NativeShaderStage(st.stage);
+						stage_ci.module = module;
+						stage_ci.pName  = "main";
+						shader_stages.push_back(stage_ci);
 					}
 				}
 
