@@ -556,9 +556,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	CreatePrecompiledGraphicsPipeline(
 	    graphics, pipeline, rendering, static_params,
-	    std::span(shader_stages, shader_stage_count),
-	    std::span(input_attr, vertex_input.attribute_count),
-	    std::span(input_desc, vertex_input.binding_count),
+	    std::span<const vk::PipelineShaderStageCreateInfo>(shader_stages, shader_stage_count),
+	    std::span<const vk::VertexInputAttributeDescription>(input_attr, vertex_input.attribute_count),
+	    std::span<const vk::VertexInputBindingDescription>(input_desc, vertex_input.binding_count),
 	    mesh, tessellation, rect_list,
 	    tessellation ? vs_input_info.tess.input_control_points : 3u,
 	    driver_cache);

@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "loader/systemContent.h"
@@ -541,9 +542,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 }
 
 PipelineCache::~PipelineCache() {
-	if (m_precompile_thread.Joinable()) {
-		m_precompile_thread.Join();
-	}
+	m_precompile_stop.store(true, std::memory_order_release);
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -798,7 +797,12 @@ void PipelineCache::LoadManifest() {
 			file.Read(&binding, sizeof(binding), &bytes_read);
 			file.Read(&format, sizeof(format), &bytes_read);
 			file.Read(&offset, sizeof(offset), &bytes_read);
-			entry.input_attributes[a] = {location, binding, static_cast<vk::Format>(format), offset};
+			vk::VertexInputAttributeDescription attr_desc {};
+			attr_desc.location = location;
+			attr_desc.binding  = binding;
+			attr_desc.format   = static_cast<vk::Format>(format);
+			attr_desc.offset   = offset;
+			entry.input_attributes[a] = attr_desc;
 		}
 		uint32_t bind_count = 0;
 		file.Read(&bind_count, sizeof(bind_count), &bytes_read);
@@ -808,7 +812,11 @@ void PipelineCache::LoadManifest() {
 			file.Read(&binding, sizeof(binding), &bytes_read);
 			file.Read(&stride, sizeof(stride), &bytes_read);
 			file.Read(&input_rate, sizeof(input_rate), &bytes_read);
-			entry.input_bindings[bi] = {binding, stride, static_cast<vk::VertexInputRate>(input_rate)};
+			vk::VertexInputBindingDescription bind_desc {};
+			bind_desc.binding   = binding;
+			bind_desc.stride    = stride;
+			bind_desc.inputRate = static_cast<vk::VertexInputRate>(input_rate);
+			entry.input_bindings[bi] = bind_desc;
 		}
 		g_manifest_graphics.emplace(entry.key, std::move(entry));
 	}
@@ -924,122 +932,135 @@ void PipelineCache::PrecompilePipelines() {
 	}
 
 	SetPipelineCompilationProgress(true, 0, total);
-	m_precompile_thread = Common::Thread([this, total](void*) {
-		uint32_t current = 0;
+	Common::Thread precompile_thread([](void* arg) {
+		auto* self = static_cast<PipelineCache*>(arg);
+		self->PrecompilePipelinesWorker();
+	}, this);
+	precompile_thread.Detach();
+}
 
-		// 1. Compute Pipelines
-		{
-			std::scoped_lock lock(g_manifest_mutex);
-			for (const auto& [id, entry]: g_manifest_compute) {
-				if (m_compute_pipelines.contains(id)) {
-					current++;
-					SetPipelineCompilationProgress(true, current, total);
-					continue;
+void PipelineCache::PrecompilePipelinesWorker() {
+	const uint32_t total = static_cast<uint32_t>(g_manifest_compute.size() + g_manifest_graphics.size());
+	uint32_t current = 0;
+
+	// 1. Compute Pipelines
+	{
+		std::scoped_lock lock(g_manifest_mutex);
+		for (const auto& [id, entry]: g_manifest_compute) {
+			if (m_precompile_stop.load(std::memory_order_relaxed)) {
+				break;
+			}
+			if (m_compute_pipelines.contains(id)) {
+				current++;
+				SetPipelineCompilationProgress(true, current, total);
+				continue;
+			}
+
+			auto cached = std::make_unique<Pipeline>();
+			vk::ShaderModuleCreateInfo sm_info {};
+			sm_info.codeSize = entry.spirv.size() * sizeof(uint32_t);
+			sm_info.pCode = entry.spirv.data();
+			vk::ShaderModule module = nullptr;
+			if (m_graphics.device.createShaderModule(&sm_info, nullptr, &module) == vk::Result::eSuccess) {
+				CreateDescriptorLayout(m_graphics, *cached, entry.bindings);
+				const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
+				                                            ShaderRecompiler::IR::NativePushConstantSize};
+				vk::PipelineLayoutCreateInfo pl_info {};
+				pl_info.setLayoutCount = 1;
+				pl_info.pSetLayouts = &cached->descriptor_set_layout;
+				pl_info.pushConstantRangeCount = 1;
+				pl_info.pPushConstantRanges = &push_constants;
+				if (m_graphics.device.createPipelineLayout(&pl_info, nullptr, &cached->pipeline_layout) == vk::Result::eSuccess) {
+					vk::ComputePipelineCreateInfo cp_info {};
+					cp_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+					cp_info.stage.module = module;
+					cp_info.stage.pName = "main";
+					vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
+					if (m_graphics.compute_subgroup_size_control_enabled &&
+					    entry.wave_size >= m_graphics.min_subgroup_size && entry.wave_size <= m_graphics.max_subgroup_size) {
+						comp_subgroup_size.requiredSubgroupSize = entry.wave_size;
+						cp_info.stage.pNext = &comp_subgroup_size;
+					}
+					cp_info.layout = cached->pipeline_layout;
+					cp_info.basePipelineIndex = -1;
+					if (m_graphics.device.createComputePipelines(m_driver_cache, 1, &cp_info, nullptr, &cached->pipeline) == vk::Result::eSuccess) {
+						m_compute_pipelines.emplace(id, std::move(cached));
+					}
 				}
+				m_graphics.device.destroyShaderModule(module, nullptr);
+			}
+			current++;
+			SetPipelineCompilationProgress(true, current, total);
+		}
+	}
 
-				auto cached = std::make_unique<Pipeline>();
+	// 2. Graphics Pipelines
+	{
+		std::scoped_lock lock(g_manifest_mutex);
+		for (const auto& [key, entry]: g_manifest_graphics) {
+			if (m_precompile_stop.load(std::memory_order_relaxed)) {
+				break;
+			}
+			if (m_graphics_pipelines.contains(key)) {
+				current++;
+				SetPipelineCompilationProgress(true, current, total);
+				continue;
+			}
+
+			auto cached = std::make_unique<Pipeline>();
+			std::vector<vk::ShaderModule> modules_to_destroy;
+			std::vector<vk::PipelineShaderStageCreateInfo> shader_stages;
+			for (const auto& st: entry.stages) {
 				vk::ShaderModuleCreateInfo sm_info {};
-				sm_info.codeSize = entry.spirv.size() * sizeof(uint32_t);
-				sm_info.pCode = entry.spirv.data();
+				sm_info.codeSize = st.spirv.size() * sizeof(uint32_t);
+				sm_info.pCode = st.spirv.data();
 				vk::ShaderModule module = nullptr;
 				if (m_graphics.device.createShaderModule(&sm_info, nullptr, &module) == vk::Result::eSuccess) {
-					CreateDescriptorLayout(m_graphics, *cached, entry.bindings);
-					const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
-					                                            ShaderRecompiler::IR::NativePushConstantSize};
-					vk::PipelineLayoutCreateInfo pl_info {};
-					pl_info.setLayoutCount = 1;
-					pl_info.pSetLayouts = &cached->descriptor_set_layout;
-					pl_info.pushConstantRangeCount = 1;
-					pl_info.pPushConstantRanges = &push_constants;
-					if (m_graphics.device.createPipelineLayout(&pl_info, nullptr, &cached->pipeline_layout) == vk::Result::eSuccess) {
-						vk::ComputePipelineCreateInfo cp_info {};
-						cp_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
-						cp_info.stage.module = module;
-						cp_info.stage.pName = "main";
-						vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
-						if (m_graphics.compute_subgroup_size_control_enabled &&
-						    entry.wave_size >= m_graphics.min_subgroup_size && entry.wave_size <= m_graphics.max_subgroup_size) {
-							comp_subgroup_size.requiredSubgroupSize = entry.wave_size;
-							cp_info.stage.pNext = &comp_subgroup_size;
-						}
-						cp_info.layout = cached->pipeline_layout;
-						cp_info.basePipelineIndex = -1;
-						if (m_graphics.device.createComputePipelines(m_driver_cache, 1, &cp_info, nullptr, &cached->pipeline) == vk::Result::eSuccess) {
-							m_compute_pipelines.emplace(id, std::move(cached));
-						}
-					}
-					m_graphics.device.destroyShaderModule(module, nullptr);
+					modules_to_destroy.push_back(module);
+					vk::PipelineShaderStageCreateInfo stage_ci {};
+					stage_ci.stage  = NativeShaderStage(st.stage);
+					stage_ci.module = module;
+					stage_ci.pName  = "main";
+					shader_stages.push_back(stage_ci);
 				}
-				current++;
-				SetPipelineCompilationProgress(true, current, total);
 			}
-		}
 
-		// 2. Graphics Pipelines
-		{
-			std::scoped_lock lock(g_manifest_mutex);
-			for (const auto& [key, entry]: g_manifest_graphics) {
-				if (m_graphics_pipelines.contains(key)) {
-					current++;
-					SetPipelineCompilationProgress(true, current, total);
-					continue;
-				}
-
-				auto cached = std::make_unique<Pipeline>();
-				std::vector<vk::ShaderModule> modules_to_destroy;
-				std::vector<vk::PipelineShaderStageCreateInfo> shader_stages;
+			if (shader_stages.size() == entry.stages.size()) {
+				CreateDescriptorLayout(m_graphics, *cached, entry.bindings);
+				vk::ShaderStageFlags graphics_stages = vk::ShaderStageFlagBits::eFragment;
 				for (const auto& st: entry.stages) {
-					vk::ShaderModuleCreateInfo sm_info {};
-					sm_info.codeSize = st.spirv.size() * sizeof(uint32_t);
-					sm_info.pCode = st.spirv.data();
-					vk::ShaderModule module = nullptr;
-					if (m_graphics.device.createShaderModule(&sm_info, nullptr, &module) == vk::Result::eSuccess) {
-						modules_to_destroy.push_back(module);
-						vk::PipelineShaderStageCreateInfo stage_ci {};
-						stage_ci.stage  = NativeShaderStage(st.stage);
-						stage_ci.module = module;
-						stage_ci.pName  = "main";
-						shader_stages.push_back(stage_ci);
+					graphics_stages |= NativeShaderStage(st.stage);
+				}
+				const vk::PushConstantRange push_constants {graphics_stages, 0,
+				                                            ShaderRecompiler::IR::NativePushConstantSize};
+				vk::PipelineLayoutCreateInfo pl_info {};
+				pl_info.setLayoutCount = 1;
+				pl_info.pSetLayouts = &cached->descriptor_set_layout;
+				pl_info.pushConstantRangeCount = 1;
+				pl_info.pPushConstantRanges = &push_constants;
+				if (m_graphics.device.createPipelineLayout(&pl_info, nullptr, &cached->pipeline_layout) == vk::Result::eSuccess) {
+					CreatePrecompiledGraphicsPipeline(
+						m_graphics, *cached, key.rendering, key.static_params,
+						shader_stages, entry.input_attributes, entry.input_bindings,
+						entry.mesh, entry.tessellation, entry.rect_list,
+						entry.patch_control_points, m_driver_cache);
+					if (cached->pipeline != nullptr) {
+						m_graphics_pipelines.emplace(key, std::move(cached));
 					}
 				}
-
-				if (shader_stages.size() == entry.stages.size()) {
-					CreateDescriptorLayout(m_graphics, *cached, entry.bindings);
-					vk::ShaderStageFlags graphics_stages = vk::ShaderStageFlagBits::eFragment;
-					for (const auto& st: entry.stages) {
-						graphics_stages |= NativeShaderStage(st.stage);
-					}
-					const vk::PushConstantRange push_constants {graphics_stages, 0,
-					                                            ShaderRecompiler::IR::NativePushConstantSize};
-					vk::PipelineLayoutCreateInfo pl_info {};
-					pl_info.setLayoutCount = 1;
-					pl_info.pSetLayouts = &cached->descriptor_set_layout;
-					pl_info.pushConstantRangeCount = 1;
-					pl_info.pPushConstantRanges = &push_constants;
-					if (m_graphics.device.createPipelineLayout(&pl_info, nullptr, &cached->pipeline_layout) == vk::Result::eSuccess) {
-						CreatePrecompiledGraphicsPipeline(
-							m_graphics, *cached, key.rendering, key.static_params,
-							shader_stages, entry.input_attributes, entry.input_bindings,
-							entry.mesh, entry.tessellation, entry.rect_list,
-							entry.patch_control_points, m_driver_cache);
-						if (cached->pipeline != nullptr) {
-							m_graphics_pipelines.emplace(key, std::move(cached));
-						}
-					}
-				}
-
-				for (auto m: modules_to_destroy) {
-					m_graphics.device.destroyShaderModule(m, nullptr);
-				}
-
-				current++;
-				SetPipelineCompilationProgress(true, current, total);
 			}
-		}
 
-		SetPipelineCompilationProgress(false, total, total);
-		PipelineCacheLog("Vulkan pipeline precompilation finished: precompiled {} pipelines", total);
-	}, nullptr);
+			for (auto m: modules_to_destroy) {
+				m_graphics.device.destroyShaderModule(m, nullptr);
+			}
+
+			current++;
+			SetPipelineCompilationProgress(true, current, total);
+		}
+	}
+
+	SetPipelineCompilationProgress(false, total, total);
+	PipelineCacheLog("Vulkan pipeline precompilation finished: precompiled {} pipelines", total);
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -1409,11 +1430,12 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 					for (auto mask = perm->program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
 						const auto index = std::countr_zero(mask);
 						const auto kind = static_cast<ShaderRecompiler::IR::DescriptorBindingKind>(index);
-						entry.bindings.push_back(
-						    {ShaderRecompiler::IR::NativeBinding(perm->program.stage, kind),
-						     NativeDescriptorType(kind),
-						     perm->program.bindings.descriptor_counts[index],
-						     NativeShaderStage(vertex_info[i].logical_stage), nullptr});
+						vk::DescriptorSetLayoutBinding b {};
+						b.binding         = ShaderRecompiler::IR::NativeBinding(perm->program.stage, kind);
+						b.descriptorType  = NativeDescriptorType(kind);
+						b.descriptorCount = perm->program.bindings.descriptor_counts[index];
+						b.stageFlags      = NativeShaderStage(vertex_info[i].logical_stage);
+						entry.bindings.push_back(b);
 					}
 				}
 			}
@@ -1424,19 +1446,21 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 					for (auto mask = perm->program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
 						const auto index = std::countr_zero(mask);
 						const auto kind = static_cast<ShaderRecompiler::IR::DescriptorBindingKind>(index);
-						entry.bindings.push_back(
-						    {ShaderRecompiler::IR::NativeBinding(perm->program.stage, kind),
-						     NativeDescriptorType(kind),
-						     perm->program.bindings.descriptor_counts[index],
-						     vk::ShaderStageFlagBits::eFragment, nullptr});
+						vk::DescriptorSetLayoutBinding b {};
+						b.binding         = ShaderRecompiler::IR::NativeBinding(perm->program.stage, kind);
+						b.descriptorType  = NativeDescriptorType(kind);
+						b.descriptorCount = perm->program.bindings.descriptor_counts[index];
+						b.stageFlags      = vk::ShaderStageFlagBits::eFragment;
+						entry.bindings.push_back(b);
 					}
 				}
 			}
 			for (uint32_t binding = 0; binding < key.vertex_input.binding_count; binding++) {
-				entry.input_bindings.push_back({
-					binding, key.vertex_input.bindings[binding].stride,
-					key.vertex_input.bindings[binding].instance ? vk::VertexInputRate::eInstance : vk::VertexInputRate::eVertex
-				});
+				vk::VertexInputBindingDescription bind_desc {};
+				bind_desc.binding   = binding;
+				bind_desc.stride    = key.vertex_input.bindings[binding].stride;
+				bind_desc.inputRate = key.vertex_input.bindings[binding].instance ? vk::VertexInputRate::eInstance : vk::VertexInputRate::eVertex;
+				entry.input_bindings.push_back(bind_desc);
 			}
 			for (uint32_t attr = 0; attr < key.vertex_input.attribute_count; attr++) {
 				uint32_t attr_size = 4;
@@ -1445,9 +1469,12 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 				const auto compiled_components = vs_input_info.stage.program->info.vertex_fetch_components[attr];
 				const auto used_components = compiled_components > 0 ? static_cast<int>(compiled_components) : registers_num;
 				GetInputFormat(vs_input_info.resources[attr], format, attr_size, static_cast<uint32_t>(used_components));
-				entry.input_attributes.push_back({
-					attr, key.vertex_input.attributes[attr].binding, format, key.vertex_input.attributes[attr].offset
-				});
+				vk::VertexInputAttributeDescription attr_desc {};
+				attr_desc.location = attr;
+				attr_desc.binding  = key.vertex_input.attributes[attr].binding;
+				attr_desc.format   = format;
+				attr_desc.offset   = key.vertex_input.attributes[attr].offset;
+				entry.input_attributes.push_back(attr_desc);
 			}
 			g_manifest_graphics.emplace(key, std::move(entry));
 			m_manifest_dirty = true;
@@ -1501,11 +1528,12 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 				for (auto mask = input_info.stage.program->bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
 					const auto index = std::countr_zero(mask);
 					const auto kind = static_cast<ShaderRecompiler::IR::DescriptorBindingKind>(index);
-					entry.bindings.push_back(
-					    {ShaderRecompiler::IR::NativeBinding(input_info.stage.program->stage, kind),
-					     NativeDescriptorType(kind),
-					     input_info.stage.program->bindings.descriptor_counts[index],
-					     vk::ShaderStageFlagBits::eCompute, nullptr});
+					vk::DescriptorSetLayoutBinding b {};
+					b.binding         = ShaderRecompiler::IR::NativeBinding(input_info.stage.program->stage, kind);
+					b.descriptorType  = NativeDescriptorType(kind);
+					b.descriptorCount = input_info.stage.program->bindings.descriptor_counts[index];
+					b.stageFlags      = vk::ShaderStageFlagBits::eCompute;
+					entry.bindings.push_back(b);
 				}
 			}
 			g_manifest_compute.emplace(compute_program.id, std::move(entry));

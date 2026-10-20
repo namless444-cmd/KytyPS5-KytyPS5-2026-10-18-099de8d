@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
@@ -183,11 +184,12 @@ private:
 
 	std::filesystem::path         m_manifest_path;
 	bool                          m_manifest_dirty = false;
-	Common::Thread                m_precompile_thread;
+	std::atomic<bool>             m_precompile_stop = false;
 
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
 	void PrecompilePipelines();
+	void PrecompilePipelinesWorker();
 	void SaveManifest();
 	void LoadManifest();
 };

@@ -142,7 +142,7 @@ static void Execute(const std::filesystem::path& game_patch) {
 	Common::Thread guest_thread(
 	    [](void* param) {
 		    while (Libs::Graphics::IsPipelineCompilationActive()) {
-			    Common::Thread::SleepMilli(16);
+			    Common::Thread::SleepMicro(16000);
 		    }
 		    auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 		    rt->Execute(*static_cast<const std::filesystem::path*>(param));
