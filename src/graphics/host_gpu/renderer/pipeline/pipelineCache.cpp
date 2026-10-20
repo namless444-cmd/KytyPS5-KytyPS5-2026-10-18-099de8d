@@ -486,6 +486,8 @@ struct PipelineCache::ProgramCache {
 				graphics.device.destroyShaderModule(permutation.handle.module, nullptr);
 			}
 		}
+	}
+
 	const Permutation* FindPermutation(uint64_t shader_id) const {
 		for (const auto& [key, source]: programs) {
 			for (const auto& perm: source.permutations) {
