@@ -34,6 +34,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
@@ -532,7 +533,7 @@ struct ManifestGraphicsEntry {
 
 static std::unordered_map<uint64_t, ManifestComputeEntry> g_manifest_compute;
 static std::unordered_map<PipelineCache::GraphicsPipelineKey, ManifestGraphicsEntry, PipelineCache::GraphicsPipelineKeyHash> g_manifest_graphics;
-static Common::Mutex g_manifest_mutex;
+static std::mutex g_manifest_mutex;
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics)),

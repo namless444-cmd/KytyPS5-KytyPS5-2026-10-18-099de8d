@@ -144,9 +144,6 @@ public:
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
-private:
-	struct ProgramCache;
-
 	struct GraphicsPipelineKey {
 		PipelineRenderingState   rendering;
 		std::array<uint64_t, 3>  vertex_shader_ids {};
@@ -171,6 +168,9 @@ private:
 	struct GraphicsPipelineKeyHash {
 		std::size_t operator()(const GraphicsPipelineKey& key) const;
 	};
+
+private:
+	struct ProgramCache;
 
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
